@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::index::scan::is_test_case_path;
 use anyhow::{Context as _, Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 
@@ -376,6 +377,9 @@ WHERE e.collection=?1 AND e.key IN (
     let mut out: HashMap<u64, ChunkMeta> = HashMap::new();
     for row in rows {
         let (key_i64, meta) = row.context("read representative row")?;
+        if is_test_case_path(&meta.path) {
+            continue;
+        }
         let key = key_i64 as u64;
         out.entry(key).or_insert(meta);
     }

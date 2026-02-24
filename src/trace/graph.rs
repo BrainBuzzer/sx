@@ -4,7 +4,7 @@ use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 
 use crate::index::chunk::Chunk;
-use crate::index::scan::Language;
+use crate::index::scan::{Language, is_test_case_path};
 
 use super::extract;
 use super::types::{EdgeRecord, SymbolRecord, TraceStageResult};
@@ -140,36 +140,41 @@ pub fn symbols_for_chunk_ids(
 
     for row in rows {
         let s = row.context("read symbol row")?;
+        if is_test_case_path(&s.path) {
+            continue;
+        }
         out.entry(s.chunk_id.clone()).or_default().push(s);
     }
     Ok(out)
 }
 
 pub fn symbol_by_id(conn: &Connection, symbol_id: &str) -> Result<Option<SymbolRecord>> {
-    conn.query_row(
-        r#"
+    let out: Option<SymbolRecord> = conn
+        .query_row(
+            r#"
 SELECT symbol_id, chunk_id, path, start_line, end_line, language, kind, fq_name, short_name
 FROM symbols
 WHERE symbol_id=?1
 LIMIT 1
 "#,
-        [symbol_id],
-        |row| {
-            Ok(SymbolRecord {
-                symbol_id: row.get(0)?,
-                chunk_id: row.get(1)?,
-                path: row.get(2)?,
-                start_line: row.get(3)?,
-                end_line: row.get(4)?,
-                language: row.get(5)?,
-                kind: row.get(6)?,
-                fq_name: row.get(7)?,
-                short_name: row.get(8)?,
-            })
-        },
-    )
-    .optional()
-    .context("query symbol_by_id")
+            [symbol_id],
+            |row| {
+                Ok(SymbolRecord {
+                    symbol_id: row.get(0)?,
+                    chunk_id: row.get(1)?,
+                    path: row.get(2)?,
+                    start_line: row.get(3)?,
+                    end_line: row.get(4)?,
+                    language: row.get(5)?,
+                    kind: row.get(6)?,
+                    fq_name: row.get(7)?,
+                    short_name: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .context("query symbol_by_id")?;
+    Ok(out.filter(|s| !is_test_case_path(&s.path)))
 }
 
 pub fn symbols_for_path_line(
@@ -204,7 +209,11 @@ ORDER BY (end_line - start_line) ASC
         .context("query symbols_for_path_line")?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row.context("read symbols_for_path_line row")?);
+        let sym = row.context("read symbols_for_path_line row")?;
+        if is_test_case_path(&sym.path) {
+            continue;
+        }
+        out.push(sym);
     }
     Ok(out)
 }
@@ -255,7 +264,11 @@ pub fn outgoing_edges(
 
     let mut out = Vec::new();
     for row in rows {
-        out.push(row.context("read outgoing edge row")?);
+        let edge = row.context("read outgoing edge row")?;
+        if is_test_case_path(&edge.path) {
+            continue;
+        }
+        out.push(edge);
     }
     Ok(out)
 }
@@ -265,34 +278,47 @@ pub fn resolve_symbol_id(
     src_path: &str,
     dst_name: &str,
 ) -> Result<Option<String>> {
-    let fq: Option<String> = conn
-        .query_row(
-            "SELECT symbol_id FROM symbols WHERE fq_name=?1 LIMIT 1",
-            [dst_name],
-            |row| row.get(0),
-        )
-        .optional()
-        .context("resolve symbol by fq_name")?;
-    if fq.is_some() {
-        return Ok(fq);
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT symbol_id FROM symbols WHERE fq_name=?1 ORDER BY path ASC, start_line ASC LIMIT 64",
+            )
+            .context("prepare resolve symbol by fq_name")?;
+        let rows = stmt
+            .query_map([dst_name], |row| row.get::<_, String>(0))
+            .context("query resolve symbol by fq_name")?;
+        for row in rows {
+            let symbol_id = row.context("read resolve symbol by fq_name row")?;
+            if symbol_by_id(conn, &symbol_id)?.is_some() {
+                return Ok(Some(symbol_id));
+            }
+        }
     }
 
     let short = dst_name.rsplit("::").next().unwrap_or(dst_name);
-    let short: Option<String> = conn
-        .query_row(
+    let mut stmt = conn
+        .prepare(
             r#"
 SELECT symbol_id
 FROM symbols
 WHERE short_name=?1
 ORDER BY (path=?2) DESC, path ASC, start_line ASC
-LIMIT 1
+LIMIT 128
 "#,
-            rusqlite::params![short, src_path],
-            |row| row.get(0),
         )
-        .optional()
-        .context("resolve symbol by short_name")?;
-    Ok(short)
+        .context("prepare resolve symbol by short_name")?;
+    let rows = stmt
+        .query_map(rusqlite::params![short, src_path], |row| {
+            row.get::<_, String>(0)
+        })
+        .context("query resolve symbol by short_name")?;
+    for row in rows {
+        let symbol_id = row.context("read resolve symbol by short_name row")?;
+        if symbol_by_id(conn, &symbol_id)?.is_some() {
+            return Ok(Some(symbol_id));
+        }
+    }
+    Ok(None)
 }
 
 pub fn get_cached_stage(

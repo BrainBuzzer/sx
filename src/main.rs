@@ -713,7 +713,7 @@ fn default_embed_model<'a>(
         return current_model;
     }
     match provider {
-        "voyage" => "voyage-3.5",
+        "voyage" => "voyage-code-3",
         "openai" => "text-embedding-3-small",
         _ => "nomic-embed-text",
     }

@@ -301,7 +301,7 @@ pub struct QueryArgs {
     #[arg(long, default_value_t = 200)]
     pub vec_limit: usize,
 
-    /// Enable deep mode (PRF expansion + deterministic rerank; optional LLM expansion)
+    /// Enable deep mode (PRF expansion + rerank; optional LLM expansion)
     #[arg(long)]
     pub deep: bool,
 

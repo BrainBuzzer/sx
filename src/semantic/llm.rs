@@ -1,7 +1,8 @@
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use serde_json::Value;
 
 use crate::config;
@@ -58,6 +59,91 @@ pub fn expand_queries_cached(
     let expansions = client.expand_queries(query, hints)?;
     put_cached_expansions(conn, provider_str, &model, query, &expansions)?;
     Ok(expansions)
+}
+
+#[derive(Debug, Clone)]
+pub struct RerankCandidate {
+    pub chunk_id: String,
+    pub content_hash: String,
+    pub text: String,
+}
+
+pub fn rerank_with_voyage_cached(
+    conn: &Connection,
+    cfg: &config::Config,
+    query: &str,
+    candidates: &[RerankCandidate],
+) -> Result<HashMap<String, f64>> {
+    let query = query.trim();
+    if query.is_empty() || candidates.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let provider = "voyage";
+    let model = if cfg.providers.voyage.rerank_model.trim().is_empty() {
+        "rerank-2.5".to_string()
+    } else {
+        cfg.providers.voyage.rerank_model.trim().to_string()
+    };
+
+    let mut seen = HashSet::new();
+    let mut unique_hashes = Vec::new();
+    let mut unique_docs = Vec::new();
+    for c in candidates {
+        let hash = c.content_hash.trim();
+        if hash.is_empty() {
+            continue;
+        }
+        if seen.insert(hash.to_string()) {
+            unique_hashes.push(hash.to_string());
+            unique_docs.push(c.text.clone());
+        }
+    }
+    if unique_hashes.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut by_hash = get_cached_rerank_scores(conn, provider, &model, query, &unique_hashes)?;
+
+    let mut missing_hashes = Vec::new();
+    let mut missing_docs = Vec::new();
+    for (hash, doc) in unique_hashes.iter().zip(unique_docs.iter()) {
+        if !by_hash.contains_key(hash) {
+            missing_hashes.push(hash.clone());
+            missing_docs.push(doc.clone());
+        }
+    }
+
+    if !missing_docs.is_empty() {
+        let client = VoyageRerankClient::new(
+            &cfg.providers.voyage.base_url,
+            &cfg.providers.voyage.api_key_env,
+            &model,
+        )?;
+        let scores = client.rerank(query, &missing_docs)?;
+        if scores.len() != missing_hashes.len() {
+            return Err(anyhow!(
+                "voyage rerank: expected {} scores, got {}",
+                missing_hashes.len(),
+                scores.len()
+            ));
+        }
+
+        let mut fresh = HashMap::new();
+        for (hash, score) in missing_hashes.into_iter().zip(scores.into_iter()) {
+            by_hash.insert(hash.clone(), score);
+            fresh.insert(hash, score);
+        }
+        put_cached_rerank_scores(conn, provider, &model, query, &fresh)?;
+    }
+
+    let mut out = HashMap::new();
+    for c in candidates {
+        if let Some(score) = by_hash.get(&c.content_hash) {
+            out.insert(c.chunk_id.clone(), *score);
+        }
+    }
+    Ok(out)
 }
 
 trait LlmClient {
@@ -239,6 +325,44 @@ impl LlmClient for ZhipuClient {
     }
 }
 
+#[derive(Clone)]
+struct VoyageRerankClient {
+    agent: ureq::Agent,
+    base_url: String,
+    api_key_env: String,
+    model: String,
+}
+
+impl VoyageRerankClient {
+    fn new(base_url: &str, api_key_env: &str, model: &str) -> Result<Self> {
+        let cfg = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(60)))
+            .build();
+        let agent: ureq::Agent = cfg.into();
+        Ok(Self {
+            agent,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            api_key_env: api_key_env.to_string(),
+            model: model.to_string(),
+        })
+    }
+
+    fn rerank(&self, query: &str, documents: &[String]) -> Result<Vec<f64>> {
+        let api_key = config::resolve_voyage_api_key(&self.api_key_env)?;
+        let url = format!("{}/rerank", self.base_url);
+        let payload = serde_json::json!({
+            "model": self.model,
+            "query": query,
+            "documents": documents,
+        });
+
+        let headers = [("Authorization", format!("Bearer {api_key}"))];
+        let json = post_json_with_retry(&self.agent, &url, &payload, Some(&headers))?;
+        parse_voyage_rerank_scores(&json, documents.len())
+    }
+}
+
 fn expansion_prompt(query: &str, hints: &[String]) -> String {
     let mut p = String::new();
     p.push_str("You expand code search queries for a local repository search tool.\n");
@@ -276,6 +400,42 @@ fn parse_expansions(body: &str, original: &str) -> Vec<String> {
         }
     }
     out
+}
+
+fn parse_voyage_rerank_scores(json: &Value, expected: usize) -> Result<Vec<f64>> {
+    let items = json
+        .get("data")
+        .and_then(|v| v.as_array())
+        .or_else(|| json.get("results").and_then(|v| v.as_array()))
+        .ok_or_else(|| anyhow!("voyage rerank: missing data/results array"))?;
+
+    let mut out = vec![0.0f64; expected];
+    let mut seen = 0usize;
+
+    for item in items {
+        let index = item
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .or_else(|| item.get("document_index").and_then(|v| v.as_u64()));
+        let score = item
+            .get("relevance_score")
+            .and_then(|v| v.as_f64())
+            .or_else(|| item.get("score").and_then(|v| v.as_f64()));
+        let (Some(index), Some(score)) = (index, score) else {
+            continue;
+        };
+        let idx = index as usize;
+        if idx >= expected {
+            continue;
+        }
+        out[idx] = score;
+        seen += 1;
+    }
+
+    if seen == 0 {
+        return Err(anyhow!("voyage rerank: response had no usable scores"));
+    }
+    Ok(out)
 }
 
 fn extract_openai_output_text(json: &Value) -> Option<String> {
@@ -375,6 +535,81 @@ ON CONFLICT(provider, model, query) DO UPDATE SET
         rusqlite::params![provider, model, query, json],
     )
     .context("upsert llm_expansion_cache")?;
+    Ok(())
+}
+
+fn get_cached_rerank_scores(
+    conn: &Connection,
+    provider: &str,
+    model: &str,
+    query: &str,
+    content_hashes: &[String],
+) -> Result<HashMap<String, f64>> {
+    if content_hashes.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut sql = String::from(
+        r#"
+SELECT content_hash, score
+FROM llm_rerank_cache
+WHERE provider=?1 AND model=?2 AND query=?3 AND content_hash IN (
+"#,
+    );
+    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+    params.push(Box::new(provider.to_string()));
+    params.push(Box::new(model.to_string()));
+    params.push(Box::new(query.to_string()));
+
+    for (i, hash) in content_hashes.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('?');
+        sql.push_str(&(params.len() + 1).to_string());
+        params.push(Box::new(hash.clone()));
+    }
+    sql.push_str(")\n");
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("prepare llm_rerank_cache query")?;
+    let rows = stmt
+        .query_map(params_from_iter(params.iter()), |row| {
+            let hash: String = row.get(0)?;
+            let score: f64 = row.get(1)?;
+            Ok((hash, score))
+        })
+        .context("query llm_rerank_cache")?;
+
+    let mut out = HashMap::new();
+    for row in rows {
+        let (hash, score) = row.context("read llm_rerank_cache row")?;
+        out.insert(hash, score);
+    }
+    Ok(out)
+}
+
+fn put_cached_rerank_scores(
+    conn: &Connection,
+    provider: &str,
+    model: &str,
+    query: &str,
+    scores_by_hash: &HashMap<String, f64>,
+) -> Result<()> {
+    for (content_hash, score) in scores_by_hash {
+        conn.execute(
+            r#"
+INSERT INTO llm_rerank_cache(provider, model, query, content_hash, score, updated_at)
+VALUES(?1, ?2, ?3, ?4, ?5, strftime('%s','now'))
+ON CONFLICT(provider, model, query, content_hash) DO UPDATE SET
+  score=excluded.score,
+  updated_at=excluded.updated_at
+"#,
+            rusqlite::params![provider, model, query, content_hash, *score],
+        )
+        .context("upsert llm_rerank_cache")?;
+    }
     Ok(())
 }
 

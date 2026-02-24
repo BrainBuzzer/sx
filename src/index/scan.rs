@@ -120,6 +120,9 @@ pub fn scan_repo(root_dir: &Path, cfg: &config::Config) -> Result<Vec<ScannedFil
 
         let repo_path = root::to_repo_path(&root_dir, &abs_path)
             .with_context(|| format!("repo path {}", abs_path.display()))?;
+        if is_test_case_path(&repo_path) {
+            continue;
+        }
 
         let language = Language::from_path(&abs_path);
 
@@ -140,6 +143,10 @@ fn build_excludes(cfg: &config::Config) -> Vec<String> {
         ".git/".to_string(),
         ".sx/".to_string(),
         "target/".to_string(),
+        "test/".to_string(),
+        "tests/".to_string(),
+        "__test__/".to_string(),
+        "__tests__/".to_string(),
         "node_modules/".to_string(),
         "dist/".to_string(),
         "build/".to_string(),
@@ -187,6 +194,57 @@ fn filter_entry(root_dir: &Path, entry: &DirEntry, excludes: &[String]) -> bool 
         }
     }
     true
+}
+
+pub fn is_test_case_path(repo_path: &str) -> bool {
+    if repo_path.trim().is_empty() {
+        return false;
+    }
+
+    let normalized = repo_path.replace('\\', "/");
+    let mut parts = normalized
+        .trim_matches('/')
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .peekable();
+
+    while let Some(part) = parts.next() {
+        // Directory segments: treat common test folder names as test-only.
+        if parts.peek().is_some() {
+            if has_test_token(part, false) {
+                return true;
+            }
+            continue;
+        }
+
+        // File names: match common cross-language test naming conventions.
+        let file = part.to_ascii_lowercase();
+        if file.contains(".test.") || file.contains(".spec.") {
+            return true;
+        }
+        let stem = file
+            .rsplit_once('.')
+            .map(|(s, _)| s)
+            .unwrap_or(file.as_str());
+        if has_test_token(stem, true) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn has_test_token(value: &str, include_spec: bool) -> bool {
+    value
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .any(|tok| {
+            tok.eq_ignore_ascii_case("test")
+                || tok.eq_ignore_ascii_case("tests")
+                || tok.eq_ignore_ascii_case("testing")
+                || (include_spec
+                    && (tok.eq_ignore_ascii_case("spec") || tok.eq_ignore_ascii_case("specs")))
+        })
 }
 
 fn is_likely_binary_ext(path: &Path) -> bool {
@@ -300,5 +358,45 @@ mod tests {
         assert_eq!(Language::from_path(Path::new("a.py")), Language::Python);
         assert_eq!(Language::from_path(Path::new("a.go")), Language::Go);
         assert_eq!(Language::from_path(Path::new("a.md")), Language::Markdown);
+    }
+
+    #[test]
+    fn scan_ignores_test_case_paths() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".git")).expect("create .git");
+        std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("create tests");
+        std::fs::create_dir_all(dir.path().join("integration_test"))
+            .expect("create integration_test");
+
+        std::fs::write(dir.path().join("src/service.go"), "package main\n").expect("write prod");
+        std::fs::write(dir.path().join("src/service_test.go"), "package main\n")
+            .expect("write go test");
+        std::fs::write(dir.path().join("src/service.test.ts"), "export {};\n")
+            .expect("write ts test");
+        std::fs::write(dir.path().join("src/service.spec.ts"), "export {};\n")
+            .expect("write ts spec");
+        std::fs::write(dir.path().join("tests/unit.go"), "package tests\n")
+            .expect("write tests dir");
+        std::fs::write(
+            dir.path().join("integration_test/helper.go"),
+            "package helper\n",
+        )
+        .expect("write integration test dir");
+        std::fs::write(dir.path().join("src/contest.go"), "package main\n").expect("write contest");
+        std::fs::write(dir.path().join("src/specification.go"), "package main\n")
+            .expect("write specification");
+
+        let files = scan_repo(dir.path(), &test_config()).expect("scan");
+        let paths: Vec<String> = files.into_iter().map(|f| f.repo_path).collect();
+
+        assert!(paths.contains(&"src/service.go".to_string()));
+        assert!(paths.contains(&"src/contest.go".to_string()));
+        assert!(paths.contains(&"src/specification.go".to_string()));
+        assert!(!paths.contains(&"src/service_test.go".to_string()));
+        assert!(!paths.contains(&"src/service.test.ts".to_string()));
+        assert!(!paths.contains(&"src/service.spec.ts".to_string()));
+        assert!(!paths.contains(&"tests/unit.go".to_string()));
+        assert!(!paths.contains(&"integration_test/helper.go".to_string()));
     }
 }

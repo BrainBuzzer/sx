@@ -2,6 +2,8 @@ use anyhow::{Context as _, Result};
 use rusqlite::{Connection, ToSql, params_from_iter};
 use serde::Serialize;
 
+use crate::index::scan::is_test_case_path;
+
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
     pub query: String,
@@ -32,6 +34,7 @@ pub struct ChunkRecord {
     pub end_line: i64,
     pub kind: String,
     pub symbol: Option<String>,
+    pub content_hash: String,
     pub content: String,
 }
 
@@ -92,9 +95,10 @@ WHERE chunks_fts MATCH ?1
         sql.push(')');
     }
 
+    let query_limit = opts.limit.saturating_mul(5).max(opts.limit).max(1);
     sql.push_str(" ORDER BY bm LIMIT ?");
     sql.push_str(&(params.len() + 1).to_string());
-    params.push(Box::new(opts.limit as i64));
+    params.push(Box::new(query_limit as i64));
 
     let mut stmt = conn.prepare(&sql).context("prepare search SQL")?;
     let mut rows = stmt
@@ -115,7 +119,14 @@ WHERE chunks_fts MATCH ?1
 
     let mut out = Vec::new();
     while let Some(row) = rows.next() {
-        out.push(row.context("read search row")?);
+        let item = row.context("read search row")?;
+        if is_test_case_path(&item.path) {
+            continue;
+        }
+        out.push(item);
+        if out.len() >= opts.limit {
+            break;
+        }
     }
     Ok(out)
 }
@@ -124,9 +135,10 @@ pub fn get_chunk_by_id(conn: &Connection, chunk_id: &str) -> Result<Option<Chunk
     let mut stmt = conn
         .prepare(
             r#"
-SELECT chunk_id, path, start_line, end_line, kind, symbol, content
-FROM chunks_fts
-WHERE chunk_id=?1
+SELECT f.chunk_id, f.path, f.start_line, f.end_line, f.kind, f.symbol, c.content_hash, f.content
+FROM chunks_fts f
+JOIN chunks c ON c.chunk_id = f.chunk_id
+WHERE f.chunk_id=?1
 LIMIT 1
 "#,
         )
@@ -141,13 +153,18 @@ LIMIT 1
                 end_line: row.get(3)?,
                 kind: row.get(4)?,
                 symbol: row.get(5)?,
-                content: row.get(6)?,
+                content_hash: row.get(6)?,
+                content: row.get(7)?,
             })
         })
         .context("query get chunk")?;
 
     if let Some(row) = rows.next() {
-        return Ok(Some(row.context("read chunk row")?));
+        let chunk = row.context("read chunk row")?;
+        if is_test_case_path(&chunk.path) {
+            return Ok(None);
+        }
+        return Ok(Some(chunk));
     }
     Ok(None)
 }

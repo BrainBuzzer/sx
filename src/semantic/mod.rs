@@ -648,19 +648,65 @@ pub fn query(
     scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     if args.deep {
-        scored = hybrid::deterministic_rerank(
-            &scored,
-            cfg.deep.rerank_top,
-            &bm25_results,
-            &vec_sim_by_chunk,
-            &args.query,
-            query_vec.as_deref(),
-            index.as_ref(),
-            conn,
-            collection.as_ref().map(|c| c.collection.as_str()),
-            &cfg.vector.metric,
-        )
-        .unwrap_or(scored);
+        if cfg.deep.llm_rerank {
+            let candidates = build_voyage_rerank_candidates(
+                conn,
+                &scored,
+                cfg.deep.rerank_top,
+                cfg.embed.max_chars.min(2000),
+            )
+            .unwrap_or_default();
+            if !candidates.is_empty() {
+                if let Ok(scores_by_chunk) =
+                    llm::rerank_with_voyage_cached(conn, cfg, &args.query, &candidates)
+                {
+                    scored =
+                        apply_llm_rerank_scores(&scored, cfg.deep.rerank_top, &scores_by_chunk);
+                } else {
+                    scored = hybrid::deterministic_rerank(
+                        &scored,
+                        cfg.deep.rerank_top,
+                        &bm25_results,
+                        &vec_sim_by_chunk,
+                        &args.query,
+                        query_vec.as_deref(),
+                        index.as_ref(),
+                        conn,
+                        collection.as_ref().map(|c| c.collection.as_str()),
+                        &cfg.vector.metric,
+                    )
+                    .unwrap_or(scored);
+                }
+            } else {
+                scored = hybrid::deterministic_rerank(
+                    &scored,
+                    cfg.deep.rerank_top,
+                    &bm25_results,
+                    &vec_sim_by_chunk,
+                    &args.query,
+                    query_vec.as_deref(),
+                    index.as_ref(),
+                    conn,
+                    collection.as_ref().map(|c| c.collection.as_str()),
+                    &cfg.vector.metric,
+                )
+                .unwrap_or(scored);
+            }
+        } else {
+            scored = hybrid::deterministic_rerank(
+                &scored,
+                cfg.deep.rerank_top,
+                &bm25_results,
+                &vec_sim_by_chunk,
+                &args.query,
+                query_vec.as_deref(),
+                index.as_ref(),
+                conn,
+                collection.as_ref().map(|c| c.collection.as_str()),
+                &cfg.vector.metric,
+            )
+            .unwrap_or(scored);
+        }
     }
 
     let mut out = Vec::new();
@@ -705,6 +751,84 @@ pub fn query(
     );
 
     Ok(out)
+}
+
+fn build_voyage_rerank_candidates(
+    conn: &Connection,
+    scored: &[(String, f64)],
+    rerank_top: usize,
+    max_chars: usize,
+) -> Result<Vec<llm::RerankCandidate>> {
+    if scored.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let top = rerank_top.max(1).min(scored.len());
+    let mut out = Vec::with_capacity(top);
+
+    for (chunk_id, _) in scored.iter().take(top) {
+        let Some(chunk) = search::get_chunk_by_id(conn, chunk_id)? else {
+            continue;
+        };
+        let symbol = chunk.symbol.as_deref().unwrap_or("");
+        let content = truncate_chars(&chunk.content, max_chars.max(1));
+        let text = format!(
+            "path: {}\nlines: {}-{}\nkind: {}\nsymbol: {}\n\n{}",
+            chunk.path, chunk.start_line, chunk.end_line, chunk.kind, symbol, content
+        );
+        out.push(llm::RerankCandidate {
+            chunk_id: chunk.chunk_id,
+            content_hash: if chunk.content_hash.trim().is_empty() {
+                chunk_id.clone()
+            } else {
+                chunk.content_hash
+            },
+            text,
+        });
+    }
+
+    Ok(out)
+}
+
+fn apply_llm_rerank_scores(
+    scored: &[(String, f64)],
+    rerank_top: usize,
+    scores_by_chunk: &HashMap<String, f64>,
+) -> Vec<(String, f64)> {
+    if scored.is_empty() {
+        return Vec::new();
+    }
+
+    let top = rerank_top.max(1).min(scored.len());
+    let head = &scored[..top];
+    let tail = &scored[top..];
+
+    let mut reranked: Vec<(String, f64, f64)> = head
+        .iter()
+        .map(|(id, base_score)| {
+            let llm = scores_by_chunk
+                .get(id)
+                .copied()
+                .unwrap_or(f64::NEG_INFINITY);
+            (id.clone(), *base_score, llm)
+        })
+        .collect();
+
+    reranked.sort_by(|a, b| {
+        b.2.total_cmp(&a.2)
+            .then_with(|| b.1.total_cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut out: Vec<(String, f64)> = reranked
+        .into_iter()
+        .map(|(id, base, llm)| {
+            let score = if llm.is_finite() { llm } else { base };
+            (id, score)
+        })
+        .collect();
+    out.extend_from_slice(tail);
+    out
 }
 
 fn resolve_dim_for_embed(

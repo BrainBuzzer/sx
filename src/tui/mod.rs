@@ -196,12 +196,7 @@ fn push_flow_tree_nodes(
             depth: 1,
             label: format!(
                 "{prefix}{branch} [{}] {} -> {}  {}:{}{}",
-                node.edge_kind,
-                node.from_symbol,
-                node.target,
-                node.path,
-                node.line,
-                count_suffix
+                node.edge_kind, node.from_symbol, node.target, node.path, node.line, count_suffix
             ),
             path: node.path.clone(),
             line: node.line,
@@ -339,19 +334,16 @@ impl App {
                         self.preview_scroll = 0;
                         let _ = self.refresh_preview(conn);
                     }
-                    self.status = format!(
-                        "{}",
-                        {
-                            let roots = self.trace_root_count();
-                            if roots == 0 {
-                                format!("0 roots for \"{}\" (deep ready)", msg.query)
-                            } else if self.show_all_roots || roots == 1 {
-                                format!("{roots} roots for \"{}\" (deep ready)", msg.query)
-                            } else {
-                                format!("best root for \"{}\" (1 of {roots}; deep ready)", msg.query)
-                            }
+                    self.status = format!("{}", {
+                        let roots = self.trace_root_count();
+                        if roots == 0 {
+                            format!("0 roots for \"{}\" (deep ready)", msg.query)
+                        } else if self.show_all_roots || roots == 1 {
+                            format!("{roots} roots for \"{}\" (deep ready)", msg.query)
+                        } else {
+                            format!("best root for \"{}\" (1 of {roots}; deep ready)", msg.query)
                         }
-                    );
+                    });
                 }
             }
             if !got_update {
@@ -482,7 +474,9 @@ impl App {
 
     fn mode_hint_status(&self) -> String {
         match self.mode {
-            QueryMode::Trace => "Mode: Trace (Ctrl+T/F2 toggle · F1/Ctrl+G diagnostics)".to_string(),
+            QueryMode::Trace => {
+                "Mode: Trace (Ctrl+T/F2 toggle · F1/Ctrl+G diagnostics)".to_string()
+            }
             QueryMode::Flat => "Mode: Flat (Ctrl+T/F2 toggle · F1/Ctrl+G diagnostics)".to_string(),
         }
     }
@@ -618,7 +612,7 @@ impl App {
                     limit: 50,
                     bm25_limit: 200,
                     vec_limit: 200,
-                    deep: false,
+                    deep: true,
                     lang: Vec::new(),
                     path_prefix: Vec::new(),
                     output: crate::cli::OutputArgs::default(),
@@ -627,7 +621,7 @@ impl App {
                 let results = semantic::query(conn, db_path, cfg, args)?;
                 self.trace_response = None;
                 self.trace_nodes.clear();
-                self.status = format!("{} results for \"{}\" (flat)", results.len(), q);
+                self.status = format!("{} results for \"{}\" (flat+deep)", results.len(), q);
                 self.results = results;
                 self.results_state.select(Some(0));
                 self.preview_scroll = 0;
@@ -657,7 +651,10 @@ impl App {
                     } else if self.show_all_roots || roots == 1 {
                         format!("{roots} roots for \"{}\" (fast ready; deep refining...)", q)
                     } else {
-                        format!("best root for \"{}\" (1 of {roots}; fast ready; deep refining...)", q)
+                        format!(
+                            "best root for \"{}\" (1 of {roots}; fast ready; deep refining...)",
+                            q
+                        )
                     }
                 };
 
@@ -851,7 +848,9 @@ impl App {
             .get(start_idx..end_idx)
             .unwrap_or_default()
             .join("\n");
-        let highlighted = self.preview_highlighter.highlight_for_path(&node.path, &snippet);
+        let highlighted = self
+            .preview_highlighter
+            .highlight_for_path(&node.path, &snippet);
 
         let mut highlighted_lines = highlighted.lines.into_iter();
         let prefix_style = Style::default().fg(Color::DarkGray);
@@ -915,18 +914,9 @@ impl App {
 
         self.trace_nodes.clear();
         for (group_idx, g) in groups.iter().enumerate() {
-            let expanded = self
-                .trace_expanded
-                .get(group_idx)
-                .copied()
-                .unwrap_or(true);
+            let expanded = self.trace_expanded.get(group_idx).copied().unwrap_or(true);
             let icon = if expanded { "▼" } else { "▶" };
-            let max_hops = g
-                .paths
-                .iter()
-                .map(|p| p.steps.len())
-                .max()
-                .unwrap_or(0);
+            let max_hops = g.paths.iter().map(|p| p.steps.len()).max().unwrap_or(0);
             self.trace_nodes.push(TraceNode {
                 trace_idx: group_idx,
                 step_idx: None,
@@ -1075,10 +1065,7 @@ impl App {
             " Results "
         };
         let title = match self.focus {
-            Focus::Results => Span::styled(
-                title_name,
-                Style::default().fg(Color::Yellow),
-            ),
+            Focus::Results => Span::styled(title_name, Style::default().fg(Color::Yellow)),
             _ => Span::raw(title_name),
         };
 

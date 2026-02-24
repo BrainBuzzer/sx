@@ -11,6 +11,7 @@ use anyhow::{Context as _, Result};
 use rusqlite::Connection;
 
 use crate::cli::{OutputArgs, QueryArgs, TraceArgs};
+use crate::index::scan::is_test_case_path;
 use crate::{config, semantic};
 
 use self::types::{Citation, SymbolRecord, TraceResponse, TraceStageResult};
@@ -137,7 +138,9 @@ fn run_stage(
 ) -> Result<(TraceStageResult, String)> {
     let stage_name = if use_llm_summary { "deep" } else { "fast" };
     if let Some(cached) = graph::get_cached_stage(conn, query, stage_name)? {
-        if should_use_cached_stage(cfg, use_llm_summary, &cached) {
+        if !stage_contains_test_paths(&cached)
+            && should_use_cached_stage(cfg, use_llm_summary, &cached)
+        {
             return Ok((cached, "ready".to_string()));
         }
     }
@@ -300,6 +303,9 @@ ORDER BY path ASC, start_line ASC
     })?;
     for row in rows {
         let sym = row?;
+        if is_test_case_path(&sym.path) {
+            continue;
+        }
         let low = sym.short_name.to_ascii_lowercase();
         let mut score: f64 = 0.0;
         for t in &terms {
@@ -321,6 +327,9 @@ fn collect_citations(traces: &[types::TracePath]) -> Vec<Citation> {
     let mut seen = BTreeSet::new();
 
     for trace in traces {
+        if is_test_case_path(&trace.root_path) {
+            continue;
+        }
         let root_key = format!("{}:{}", trace.root_path, trace.root_line);
         if seen.insert(root_key) {
             out.push(Citation {
@@ -330,6 +339,9 @@ fn collect_citations(traces: &[types::TracePath]) -> Vec<Citation> {
         }
 
         for step in &trace.steps {
+            if is_test_case_path(&step.path) {
+                continue;
+            }
             let k = format!("{}:{}", step.path, step.line);
             if seen.insert(k) {
                 out.push(Citation {
@@ -340,4 +352,18 @@ fn collect_citations(traces: &[types::TracePath]) -> Vec<Citation> {
         }
     }
     out
+}
+
+fn stage_contains_test_paths(stage: &TraceStageResult) -> bool {
+    for trace in &stage.traces {
+        if is_test_case_path(&trace.root_path) {
+            return true;
+        }
+        for step in &trace.steps {
+            if is_test_case_path(&step.path) {
+                return true;
+            }
+        }
+    }
+    stage.citations.iter().any(|c| is_test_case_path(&c.path))
 }

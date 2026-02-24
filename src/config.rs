@@ -69,6 +69,7 @@ pub struct OpenAiProviderConfig {
 pub struct VoyageProviderConfig {
     pub base_url: String,
     pub api_key_env: String,
+    pub rerank_model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +254,7 @@ impl Default for VoyageProviderConfig {
         Self {
             base_url: "https://api.voyageai.com/v1".to_string(),
             api_key_env: "VOYAGE_API_KEY".to_string(),
+            rerank_model: "rerank-2.5".to_string(),
         }
     }
 }

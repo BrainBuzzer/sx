@@ -308,7 +308,7 @@ api_key_env = "VOYAGE_API_KEY"
 
 [embed]
 provider = "voyage"
-model = "voyage-3.5"
+model = "voyage-code-3"
 batch_size = 32
 max_chars = 8000
 "#,
@@ -336,6 +336,78 @@ max_chars = 8000
         .args(["vsearch", "foo", "--json"])
         .assert()
         .success();
+}
+
+#[test]
+fn deep_query_uses_voyage_rerank_model() {
+    let server = StubServer::start();
+
+    let dir = setup_repo();
+    std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+    std::fs::write(
+        dir.path().join("src/a.rs"),
+        "pub fn alpha_main() {\n  // alpha alpha token token\n}\n",
+    )
+    .expect("write a.rs");
+    std::fs::write(
+        dir.path().join("src/b.rs"),
+        "pub fn alpha_preferred() {\n  // alpha token preferred\n}\n",
+    )
+    .expect("write b.rs");
+
+    assert_cmd::cargo::cargo_bin_cmd!("sx")
+        .current_dir(dir.path())
+        .arg("init")
+        .assert()
+        .success();
+
+    write_config(
+        dir.path(),
+        &format!(
+            r#"
+version = 3
+
+[providers.voyage]
+base_url = "{base}/v1"
+api_key_env = "VOYAGE_API_KEY"
+rerank_model = "rerank-2.5"
+
+[deep]
+llm_expand = false
+llm_rerank = true
+rerank_top = 20
+"#,
+            base = server.base_url()
+        ),
+    );
+
+    assert_cmd::cargo::cargo_bin_cmd!("sx")
+        .current_dir(dir.path())
+        .arg("index")
+        .assert()
+        .success();
+
+    let out = assert_cmd::cargo::cargo_bin_cmd!("sx")
+        .current_dir(dir.path())
+        .env("VOYAGE_API_KEY", "test")
+        .args(["query", "alpha token", "--deep", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert!(server.request_count() > 0, "expected rerank request");
+
+    let results: Vec<serde_json::Value> =
+        serde_json::from_slice(&out).expect("parse JSON deep query results");
+    assert!(!results.is_empty());
+    let first_path = results
+        .first()
+        .and_then(|v| v.get("path"))
+        .and_then(|p| p.as_str())
+        .expect("first result path");
+    assert_eq!(first_path, "src/b.rs");
 }
 
 fn write_config(repo_root: &std::path::Path, body: &str) {
@@ -520,6 +592,49 @@ fn route(
             .map(|s| serde_json::json!({ "embedding": embed_text(s, dim) }))
             .collect();
         let resp = serde_json::json!({ "data": data });
+        return (200, serde_json::to_vec(&resp).unwrap());
+    }
+
+    if path == "/v1/rerank" {
+        let auth_ok = headers
+            .get("authorization")
+            .map(|v| v.to_ascii_lowercase().starts_with("bearer "))
+            .unwrap_or(false);
+        if !auth_ok {
+            return (401, b"{\"error\":\"missing auth\"}".to_vec());
+        }
+
+        let v: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+        let docs: Vec<String> = v
+            .get("documents")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+
+        let mut data: Vec<(usize, f64)> = docs
+            .iter()
+            .enumerate()
+            .map(|(idx, doc)| {
+                let score = if doc.to_ascii_lowercase().contains("preferred") {
+                    1.0
+                } else {
+                    0.1
+                };
+                (idx, score)
+            })
+            .collect();
+        data.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let resp = serde_json::json!({
+            "data": data
+                .into_iter()
+                .map(|(idx, score)| serde_json::json!({"index": idx, "relevance_score": score}))
+                .collect::<Vec<serde_json::Value>>()
+        });
         return (200, serde_json::to_vec(&resp).unwrap());
     }
 
