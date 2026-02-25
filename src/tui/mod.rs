@@ -429,7 +429,7 @@ impl App {
         }
 
         match self.focus {
-            Focus::Input => self.handle_input_key(key, conn, db_path, cfg)?,
+            Focus::Input => self.handle_input_key(key, conn, root_dir, db_path, cfg)?,
             Focus::Results => {
                 if self.handle_results_key(key, conn, root_dir, cfg, terminal)? {
                     return Ok(true);
@@ -485,11 +485,12 @@ impl App {
         &mut self,
         key: KeyEvent,
         conn: &Connection,
+        root_dir: &Path,
         db_path: &Path,
         cfg: &config::Config,
     ) -> Result<()> {
         match (key.code, key.modifiers) {
-            (KeyCode::Enter, _) => self.run_search(conn, db_path, cfg),
+            (KeyCode::Enter, _) => self.run_search(conn, root_dir, db_path, cfg),
             (KeyCode::Backspace, _) => {
                 self.input.pop();
                 Ok(())
@@ -587,6 +588,7 @@ impl App {
     fn run_search(
         &mut self,
         conn: &Connection,
+        root_dir: &Path,
         db_path: &Path,
         cfg: &config::Config,
     ) -> Result<()> {
@@ -629,7 +631,7 @@ impl App {
             }
             QueryMode::Trace => {
                 let (fast, fast_status) =
-                    trace::run_fast_stage(conn, db_path, cfg, &q, 30, 4, &[], &[])?;
+                    trace::run_fast_stage(conn, root_dir, db_path, cfg, &q, 30, 4, &[], &[])?;
                 self.trace_response = Some(trace::types::TraceResponse {
                     query: q.clone(),
                     fast,
@@ -661,6 +663,7 @@ impl App {
                 let (tx, rx) = mpsc::channel::<DeepStageUpdate>();
                 self.deep_rx = Some(rx);
                 let db_path = db_path.to_path_buf();
+                let root_dir = root_dir.to_path_buf();
                 let cfg = cfg.clone();
                 let query = q.clone();
                 std::thread::spawn(move || {
@@ -672,7 +675,7 @@ impl App {
                         return;
                     }
                     if let Ok((stage, status)) =
-                        trace::run_deep_stage(&conn, &db_path, &cfg, &query, 30, 8, &[], &[])
+                        trace::run_deep_stage(&conn, &root_dir, &db_path, &cfg, &query, 30, 8, &[], &[])
                     {
                         let _ = tx.send(DeepStageUpdate {
                             query,

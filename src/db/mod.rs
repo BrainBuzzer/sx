@@ -87,6 +87,11 @@ CREATE TABLE IF NOT EXISTS dir_frecency(
         (now.to_string(),),
     )
     .context("write meta.created_at")?;
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(key, value) VALUES('index_generation', '0')",
+        [],
+    )
+    .context("write meta.index_generation")?;
 
     let current = schema_version(conn)?.unwrap_or(1);
     if current < 2 {

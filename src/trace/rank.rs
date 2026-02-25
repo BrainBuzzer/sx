@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::TraceEdgeWeights;
 
 use super::graph;
-use super::types::{SymbolRecord, TracePath, TraceStep};
+use super::types::{EdgeRecord, SymbolRecord, TracePath, TraceStep};
 use rusqlite::Connection;
 
 #[derive(Debug, Clone)]
@@ -25,11 +25,16 @@ pub enum SearchStatus {
     Timeout,
 }
 
+pub trait EdgeProvider {
+    fn outgoing_edges(&mut self, conn: &Connection, symbol_id: &str) -> Result<Vec<EdgeRecord>>;
+}
+
 pub fn find_paths(
     conn: &Connection,
     query: &str,
     roots: &[(SymbolRecord, f64)],
     opts: &SearchOptions,
+    edge_provider: &mut dyn EdgeProvider,
 ) -> Result<(Vec<TracePath>, SearchStatus)> {
     let query_terms = query_terms(query);
     let mut all_paths = Vec::new();
@@ -37,32 +42,43 @@ pub fn find_paths(
     let deadline = Instant::now() + Duration::from_millis(opts.timeout_ms.max(50));
     let mut timed_out = false;
 
-    for (root, root_score) in roots {
+    let mut per_root_active: Vec<Vec<State>> = roots
+        .iter()
+        .map(|(root, root_score)| {
+            vec![State {
+                root: root.clone(),
+                current_symbol_id: Some(root.symbol_id.clone()),
+                score: *root_score,
+                steps: Vec::new(),
+                visited: {
+                    let mut set = HashSet::new();
+                    set.insert(root.symbol_id.clone());
+                    set
+                },
+            }]
+        })
+        .collect();
+
+    // Expand roots in lockstep by depth. This avoids starving later roots when early roots are
+    // expensive to expand (e.g., LSP-backed call hierarchy), improving coverage in the fast stage.
+    for _depth in 0..opts.max_hops.max(1) {
         if Instant::now() >= deadline {
             timed_out = true;
             break;
         }
 
-        let mut active = vec![State {
-            root: root.clone(),
-            current_symbol_id: Some(root.symbol_id.clone()),
-            score: *root_score,
-            steps: Vec::new(),
-            visited: {
-                let mut set = HashSet::new();
-                set.insert(root.symbol_id.clone());
-                set
-            },
-        }];
-
-        for _depth in 0..opts.max_hops.max(1) {
+        let mut any_active = false;
+        for active in per_root_active.iter_mut() {
             if Instant::now() >= deadline {
                 timed_out = true;
                 break;
             }
+            if active.is_empty() {
+                continue;
+            }
 
             let mut next = Vec::new();
-            for state in active {
+            for state in std::mem::take(active) {
                 if Instant::now() >= deadline {
                     timed_out = true;
                     break;
@@ -90,7 +106,7 @@ pub fn find_paths(
                         .unwrap_or_else(|| state.root.short_name.clone())
                 };
 
-                let outgoing = graph::outgoing_edges(conn, cur_id, None)?;
+                let outgoing = edge_provider.outgoing_edges(conn, cur_id)?;
                 if outgoing.is_empty() {
                     if !state.steps.is_empty() {
                         all_paths.push(state.to_trace_path());
@@ -169,10 +185,14 @@ pub fn find_paths(
 
             next.sort_by(|a, b| b.score.total_cmp(&a.score));
             next.truncate(opts.beam.max(1));
-            active = next;
-            if active.is_empty() {
-                break;
+            if !next.is_empty() {
+                any_active = true;
             }
+            *active = next;
+        }
+
+        if timed_out || !any_active {
+            break;
         }
     }
 
@@ -250,23 +270,49 @@ fn edge_weight(w: &TraceEdgeWeights, kind: &str) -> f64 {
 }
 
 fn non_overlapping(paths: Vec<TracePath>, limit: usize) -> Vec<TracePath> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    // Prefer diversity across roots first, then fill remaining slots with additional distinct paths.
     let mut out = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen_roots = HashSet::new();
+    let mut seen_endpoints = HashSet::new();
+    let mut remaining: Vec<(String, TracePath)> = Vec::new();
 
     for p in paths {
+        let endpoint = path_endpoint_key(&p);
+        if out.len() < limit && seen_roots.insert(p.root_symbol_id.clone()) && seen_endpoints.insert(endpoint.clone()) {
+            out.push(p);
+        } else {
+            remaining.push((endpoint, p));
+        }
+    }
+
+    for (endpoint, p) in remaining {
         if out.len() >= limit {
             break;
         }
-        let first = p
-            .steps
-            .first()
-            .map(|s| format!("{}:{}:{}", s.edge_kind, s.path, s.line))
-            .unwrap_or_else(|| "none".to_string());
-        let key = format!("{}|{}", p.root_symbol_id, first);
-        if seen.insert(key) {
+        if seen_endpoints.insert(endpoint) {
             out.push(p);
         }
     }
 
     out
+}
+
+fn path_endpoint_key(p: &TracePath) -> String {
+    let last = p
+        .steps
+        .last()
+        .map(|s| {
+            let target = s
+                .to_symbol
+                .as_deref()
+                .or(s.target_name.as_deref())
+                .unwrap_or("-");
+            format!("{}:{}:{}:{}", s.edge_kind, s.path, s.line, target)
+        })
+        .unwrap_or_else(|| "root".to_string());
+    format!("{}|{}", p.root_symbol_id, last)
 }

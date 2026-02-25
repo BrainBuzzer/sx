@@ -8,9 +8,9 @@ use serde::Serialize;
 
 use crate::cli::{
     CdArgs, EmbedArgs, GetArgs, GuideArgs, OpenArgs, OutputFormat, QueryArgs, SearchArgs,
-    TraceArgs, VsearchArgs,
+    TraceArgs, VsearchArgs, LspArgs, LspCommand,
 };
-use crate::{config, db, root, search, semantic, trace};
+use crate::{config, db, lsp, root, search, semantic, trace};
 
 pub fn search(
     conn: &Connection,
@@ -75,13 +75,387 @@ pub fn query(
 
 pub fn trace(
     conn: &Connection,
-    _root_dir: &Path,
+    root_dir: &Path,
     db_path: &Path,
     cfg: &config::Config,
     args: TraceArgs,
 ) -> Result<()> {
-    let out = trace::run(conn, db_path, cfg, args.clone())?;
+    let out = trace::run(conn, root_dir, db_path, cfg, args.clone())?;
     print_trace_response(&out, args.output.format())
+}
+
+pub fn lsp(root_dir: &Path, cfg: &config::Config, args: LspArgs) -> Result<()> {
+    if !cfg.lsp.enabled || !cfg.lsp.go.enabled {
+        return Err(anyhow!(
+            "LSP is disabled. Enable it in .sx/config.toml under [lsp] and [lsp.go]."
+        ));
+    }
+
+    let mut gopls = lsp::go::GoplsRunner::from_config(root_dir, cfg);
+    if !gopls.is_available() {
+        return Err(anyhow!(
+            "gopls is not available (expected `{}`). Install it with: `go install golang.org/x/tools/gopls@latest`",
+            cfg.lsp.go.gopls_path
+        ));
+    }
+
+    match args.command {
+        LspCommand::Def(a) => {
+            let pos = lsp::parse_file_position(&a.position)
+                .ok_or_else(|| anyhow!("invalid position (expected path:line:column)"))?;
+            let abs = lsp::resolve_path(root_dir, &pos.path);
+            ensure_go_file(&abs)?;
+            let res = gopls.definition(&abs, pos.line, pos.column)?;
+            print_lsp_single_def(&res, a.output.format())?;
+        }
+        LspCommand::Refs(a) => {
+            let pos = lsp::parse_file_position(&a.position)
+                .ok_or_else(|| anyhow!("invalid position (expected path:line:column)"))?;
+            let abs = lsp::resolve_path(root_dir, &pos.path);
+            ensure_go_file(&abs)?;
+            let res = gopls.references(&abs, pos.line, pos.column, a.declaration)?;
+            print_lsp_locations(&res, a.output.format())?;
+        }
+        LspCommand::Impl(a) => {
+            let pos = lsp::parse_file_position(&a.position)
+                .ok_or_else(|| anyhow!("invalid position (expected path:line:column)"))?;
+            let abs = lsp::resolve_path(root_dir, &pos.path);
+            ensure_go_file(&abs)?;
+            let res = gopls.implementation(&abs, pos.line, pos.column)?;
+            print_lsp_locations(&res, a.output.format())?;
+        }
+        LspCommand::Calls(a) => {
+            let pos = lsp::parse_file_position(&a.position)
+                .ok_or_else(|| anyhow!("invalid position (expected path:line:column)"))?;
+            let abs = lsp::resolve_path(root_dir, &pos.path);
+            ensure_go_file(&abs)?;
+            let res = gopls.call_hierarchy(&abs, pos.line, pos.column)?;
+            print_lsp_calls(&res, a.output.format())?;
+        }
+        LspCommand::Symbols(a) => {
+            let abs = lsp::resolve_path(root_dir, &a.path);
+            ensure_go_file(&abs)?;
+            let res = gopls.symbols(&abs)?;
+            print_lsp_symbols(&res, a.output.format(), &abs, root_dir)?;
+        }
+        LspCommand::WsSymbol(a) => {
+            let cwds = gopls.module_cwds_for_workspace_symbol();
+            let res = gopls.workspace_symbol(&a.query, &cwds)?;
+            print_lsp_ws_symbols(&res, a.output.format())?;
+        }
+        LspCommand::Sig(a) => {
+            let pos = lsp::parse_file_position(&a.position)
+                .ok_or_else(|| anyhow!("invalid position (expected path:line:column)"))?;
+            let abs = lsp::resolve_path(root_dir, &pos.path);
+            ensure_go_file(&abs)?;
+            let sig = gopls.signature(&abs, pos.line, pos.column)?;
+            print_lsp_signature(&sig, a.output.format())?;
+        }
+        LspCommand::Highlight(a) => {
+            let pos = lsp::parse_file_position(&a.position)
+                .ok_or_else(|| anyhow!("invalid position (expected path:line:column)"))?;
+            let abs = lsp::resolve_path(root_dir, &pos.path);
+            ensure_go_file(&abs)?;
+            let res = gopls.highlight(&abs, pos.line, pos.column)?;
+            print_lsp_locations(&res, a.output.format())?;
+        }
+        LspCommand::Check(a) => {
+            let abs = lsp::resolve_path(root_dir, &a.path);
+            ensure_go_file(&abs)?;
+            let res = gopls.check(&abs)?;
+            print_lsp_diagnostics(&res, a.output.format())?;
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_go_file(path: &std::path::Path) -> Result<()> {
+    let is_go = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("go"))
+        .unwrap_or(false);
+    if is_go {
+        Ok(())
+    } else {
+        Err(anyhow!("only Go is supported for `sx lsp` right now (.go files)"))
+    }
+}
+
+fn format_loc(loc: &lsp::Location) -> String {
+    if loc.range.start.line == loc.range.end.line {
+        if loc.range.start.column == loc.range.end.column {
+            format!("{}:{}:{}", loc.path, loc.range.start.line, loc.range.start.column)
+        } else {
+            format!(
+                "{}:{}:{}-{}",
+                loc.path, loc.range.start.line, loc.range.start.column, loc.range.end.column
+            )
+        }
+    } else {
+        format!(
+            "{}:{}:{}-{}:{}",
+            loc.path,
+            loc.range.start.line,
+            loc.range.start.column,
+            loc.range.end.line,
+            loc.range.end.column
+        )
+    }
+}
+
+fn print_lsp_single_def(res: &lsp::go::DefinitionResult, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(res)?),
+        OutputFormat::Files => println!("{}", res.location.path),
+        OutputFormat::Md => println!(
+            "- `{}` — {}",
+            format_loc(&res.location),
+            res.description
+        ),
+        OutputFormat::Text => println!(
+            "{}\t{}",
+            format_loc(&res.location),
+            res.description.replace('\n', " ")
+        ),
+    }
+    Ok(())
+}
+
+fn print_lsp_locations(locs: &[lsp::Location], format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(locs)?),
+        OutputFormat::Files => {
+            let mut uniq = BTreeSet::new();
+            for l in locs {
+                uniq.insert(l.path.clone());
+            }
+            for p in uniq {
+                println!("{p}");
+            }
+        }
+        OutputFormat::Md => {
+            for l in locs {
+                println!("- `{}`", format_loc(l));
+            }
+        }
+        OutputFormat::Text => {
+            for l in locs {
+                println!("{}", format_loc(l));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_lsp_symbols(
+    syms: &[lsp::go::DocumentSymbol],
+    format: OutputFormat,
+    abs_file: &std::path::Path,
+    root_dir: &std::path::Path,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(syms)?),
+        OutputFormat::Files => {
+            let p = lsp::normalize_path(root_dir, abs_file)?;
+            println!("{p}");
+        }
+        OutputFormat::Md => {
+            for s in syms {
+                println!(
+                    "- `{}` {} {}:{}-{}:{}",
+                    s.name,
+                    s.kind,
+                    s.range.start.line,
+                    s.range.start.column,
+                    s.range.end.line,
+                    s.range.end.column
+                );
+            }
+        }
+        OutputFormat::Text => {
+            for s in syms {
+                println!(
+                    "{}\t{}\t{}:{}-{}:{}",
+                    s.name,
+                    s.kind,
+                    s.range.start.line,
+                    s.range.start.column,
+                    s.range.end.line,
+                    s.range.end.column
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_lsp_ws_symbols(
+    syms: &[lsp::go::WorkspaceSymbol],
+    format: OutputFormat,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(syms)?),
+        OutputFormat::Files => {
+            let mut uniq = BTreeSet::new();
+            for s in syms {
+                uniq.insert(s.location.path.clone());
+            }
+            for p in uniq {
+                println!("{p}");
+            }
+        }
+        OutputFormat::Md => {
+            for s in syms {
+                println!(
+                    "- `{}` {} — `{}`",
+                    s.name,
+                    s.kind,
+                    format_loc(&s.location)
+                );
+            }
+        }
+        OutputFormat::Text => {
+            for s in syms {
+                println!(
+                    "{}\t{}\t{}",
+                    format_loc(&s.location),
+                    s.kind,
+                    s.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_lsp_diagnostics(diags: &[lsp::go::Diagnostic], format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(diags)?),
+        OutputFormat::Files => {
+            let mut uniq = BTreeSet::new();
+            for d in diags {
+                uniq.insert(d.location.path.clone());
+            }
+            for p in uniq {
+                println!("{p}");
+            }
+        }
+        OutputFormat::Md => {
+            for d in diags {
+                println!(
+                    "- `{}` — {}",
+                    format_loc(&d.location),
+                    d.message.replace('\n', " ")
+                );
+            }
+        }
+        OutputFormat::Text => {
+            for d in diags {
+                println!(
+                    "{}\t{}",
+                    format_loc(&d.location),
+                    d.message.replace('\n', " ")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_lsp_signature(sig: &str, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(sig)?),
+        OutputFormat::Files => println!("{sig}"),
+        OutputFormat::Md => println!("`{}`", sig.trim()),
+        OutputFormat::Text => println!("{}", sig.trim()),
+    }
+    Ok(())
+}
+
+fn print_lsp_calls(res: &lsp::go::CallHierarchyResult, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(res)?),
+        OutputFormat::Files => {
+            let mut uniq = BTreeSet::new();
+            if let Some(id) = &res.identifier {
+                uniq.insert(id.location.path.clone());
+            }
+            for c in &res.callers {
+                uniq.insert(c.callsite.path.clone());
+                uniq.insert(c.target.location.path.clone());
+            }
+            for c in &res.callees {
+                uniq.insert(c.callsite.path.clone());
+                uniq.insert(c.target.location.path.clone());
+            }
+            for p in uniq {
+                println!("{p}");
+            }
+        }
+        OutputFormat::Md => {
+            if let Some(id) = &res.identifier {
+                println!(
+                    "- identifier: {} `{}` @ `{}`",
+                    id.kind,
+                    id.name,
+                    format_loc(&id.location)
+                );
+            }
+            if !res.callers.is_empty() {
+                println!();
+                println!("## Callers");
+                for c in &res.callers {
+                    println!(
+                        "- `{}` -> `{}` (`{}`)",
+                        format_loc(&c.callsite),
+                        c.target.name,
+                        format_loc(&c.target.location)
+                    );
+                }
+            }
+            if !res.callees.is_empty() {
+                println!();
+                println!("## Callees");
+                for c in &res.callees {
+                    println!(
+                        "- `{}` -> `{}` (`{}`)",
+                        format_loc(&c.callsite),
+                        c.target.name,
+                        format_loc(&c.target.location)
+                    );
+                }
+            }
+        }
+        OutputFormat::Text => {
+            if let Some(id) = &res.identifier {
+                println!(
+                    "identifier\t{}\t{}\t{}",
+                    id.kind,
+                    id.name,
+                    format_loc(&id.location)
+                );
+            }
+            for c in &res.callers {
+                println!(
+                    "caller\t{}\t{}\t{}",
+                    format_loc(&c.callsite),
+                    c.target.name,
+                    format_loc(&c.target.location)
+                );
+            }
+            for c in &res.callees {
+                println!(
+                    "callee\t{}\t{}\t{}",
+                    format_loc(&c.callsite),
+                    c.target.name,
+                    format_loc(&c.target.location)
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -613,6 +987,27 @@ fn print_trace_response(out: &trace::types::TraceResponse, format: OutputFormat)
                     println!("note: `{}`", err);
                 }
                 println!("{}", deep.summary);
+                for (i, t) in deep.traces.iter().enumerate() {
+                    println!(
+                        "{}. `{}`:{} `{}` score={:.3}",
+                        i + 1,
+                        t.root_path,
+                        t.root_line,
+                        t.root_symbol,
+                        t.score
+                    );
+                    for step in &t.steps {
+                        let target = step
+                            .to_symbol
+                            .clone()
+                            .or(step.target_name.clone())
+                            .unwrap_or_else(|| "-".to_string());
+                        println!(
+                            "   - {} -> {} [{}] {}:{}",
+                            step.from_symbol, target, step.edge_kind, step.path, step.line
+                        );
+                    }
+                }
             } else {
                 println!("(disabled)");
             }
@@ -672,6 +1067,22 @@ fn print_trace_response(out: &trace::types::TraceResponse, format: OutputFormat)
                         t.root_line,
                         t.root_symbol
                     );
+                    for step in &t.steps {
+                        let target = step
+                            .to_symbol
+                            .clone()
+                            .or(step.target_name.clone())
+                            .unwrap_or_else(|| "-".to_string());
+                        println!(
+                            "  {}\t{}\t{}\t{}:{}\t{}",
+                            step.edge_kind,
+                            step.confidence,
+                            step.from_symbol,
+                            step.path,
+                            step.line,
+                            target
+                        );
+                    }
                 }
             }
         }

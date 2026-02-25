@@ -11,6 +11,7 @@ pub struct Config {
     pub scan: ScanConfig,
     pub index: IndexConfig,
     pub open: OpenConfig,
+    pub lsp: LspConfig,
     pub providers: ProvidersConfig,
     pub embed: EmbedConfig,
     pub vector: VectorConfig,
@@ -39,6 +40,23 @@ pub struct IndexConfig {
 #[serde(default)]
 pub struct OpenConfig {
     pub editor: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspConfig {
+    pub enabled: bool,
+    pub go: LspGoConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspGoConfig {
+    pub enabled: bool,
+    pub gopls_path: String,
+    pub remote: String,
+    pub timeout_ms: u64,
+    pub cache_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +166,7 @@ pub struct TraceConfig {
     pub deep_timeout_ms: u64,
     pub edge_weights: TraceEdgeWeights,
     pub llm_summary: bool,
+    pub go_use_gopls_calls: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,7 +189,7 @@ pub struct GlobalCredentials {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            version: 3,
+            version: 4,
             scan: ScanConfig {
                 exclude: vec!["target/".into(), "node_modules/".into(), ".sx/".into()],
             },
@@ -183,6 +202,7 @@ impl Default for Config {
             open: OpenConfig {
                 editor: String::new(),
             },
+            lsp: LspConfig::default(),
             providers: ProvidersConfig::default(),
             embed: EmbedConfig::default(),
             vector: VectorConfig::default(),
@@ -217,6 +237,27 @@ impl Default for OpenConfig {
     fn default() -> Self {
         Self {
             editor: String::new(),
+        }
+    }
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            go: LspGoConfig::default(),
+        }
+    }
+}
+
+impl Default for LspGoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            gopls_path: "gopls".to_string(),
+            remote: String::new(),
+            timeout_ms: 2_500,
+            cache_dir: "cache/gopls".to_string(),
         }
     }
 }
@@ -339,6 +380,7 @@ impl Default for TraceConfig {
             deep_timeout_ms: 8_000,
             edge_weights: TraceEdgeWeights::default(),
             llm_summary: true,
+            go_use_gopls_calls: true,
         }
     }
 }

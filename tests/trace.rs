@@ -1,4 +1,5 @@
 use std::fs;
+use std::process::Command;
 
 use tempfile::TempDir;
 
@@ -26,6 +27,14 @@ fn run_trace_json(repo: &std::path::Path, query: &str) -> serde_json::Value {
         .stdout
         .clone();
     serde_json::from_slice(&out).expect("parse trace json")
+}
+
+fn has_gopls() -> bool {
+    Command::new("gopls")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 #[test]
@@ -143,6 +152,153 @@ func registerRoutes() {
             .unwrap_or(false)
     });
     assert!(has_route);
+}
+
+#[test]
+fn trace_go_uses_gopls_for_call_edges_when_available() {
+    if !has_gopls() {
+        return;
+    }
+
+    let dir = setup_repo();
+    fs::write(
+        dir.path().join("go.mod"),
+        "module example.com/foo\n\ngo 1.22\n",
+    )
+    .expect("write go.mod");
+
+    fs::create_dir_all(dir.path().join("pkg")).expect("mkdir pkg");
+    fs::write(
+        dir.path().join("pkg/pkg.go"),
+        r#"
+package pkg
+
+func Bar() {}
+"#,
+    )
+    .expect("write pkg.go");
+
+    fs::write(
+        dir.path().join("main.go"),
+        r#"
+package main
+
+import "example.com/foo/pkg"
+
+func Foo() {
+    pkg.Bar()
+}
+
+func main() {
+    Foo()
+}
+"#,
+    )
+    .expect("write main.go");
+
+    run_index(dir.path());
+
+    let out = assert_cmd::cargo::cargo_bin_cmd!("sx")
+        .current_dir(dir.path())
+        .args(["trace", "Foo", "--lsp", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&out).expect("parse trace json");
+
+    let traces = json["fast"]["traces"].as_array().expect("traces");
+    assert!(!traces.is_empty());
+
+    let has_hi_conf_call = traces.iter().any(|t| {
+        t.get("steps")
+            .and_then(|s| s.as_array())
+            .map(|steps| {
+                steps.iter().any(|s| {
+                    s.get("edge_kind").and_then(|k| k.as_str()) == Some("call")
+                        && s.get("confidence")
+                            .and_then(|c| c.as_f64())
+                            .unwrap_or(0.0)
+                            >= 0.90
+                })
+            })
+            .unwrap_or(false)
+    });
+    assert!(has_hi_conf_call, "expected >=0.90 call edge confidence");
+}
+
+#[test]
+fn trace_go_multi_module_uses_nearest_go_mod_when_available() {
+    if !has_gopls() {
+        return;
+    }
+
+    let dir = setup_repo();
+    fs::create_dir_all(dir.path().join("a")).expect("mkdir a");
+    fs::create_dir_all(dir.path().join("b")).expect("mkdir b");
+
+    fs::write(
+        dir.path().join("a/go.mod"),
+        "module example.com/a\n\ngo 1.22\n",
+    )
+    .expect("write a/go.mod");
+    fs::write(
+        dir.path().join("a/a.go"),
+        r#"
+package a
+
+func Foo() { Bar() }
+func Bar() {}
+"#,
+    )
+    .expect("write a/a.go");
+
+    fs::write(
+        dir.path().join("b/go.mod"),
+        "module example.com/b\n\ngo 1.22\n",
+    )
+    .expect("write b/go.mod");
+    fs::write(
+        dir.path().join("b/b.go"),
+        r#"
+package b
+
+func Baz() {}
+"#,
+    )
+    .expect("write b/b.go");
+
+    run_index(dir.path());
+
+    let out = assert_cmd::cargo::cargo_bin_cmd!("sx")
+        .current_dir(dir.path())
+        .args(["trace", "Foo", "--lsp", "--path-prefix", "a/", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&out).expect("parse trace json");
+
+    let traces = json["fast"]["traces"].as_array().expect("traces");
+    assert!(!traces.is_empty());
+
+    let has_hi_conf_call = traces.iter().any(|t| {
+        t.get("steps")
+            .and_then(|s| s.as_array())
+            .map(|steps| {
+                steps.iter().any(|s| {
+                    s.get("edge_kind").and_then(|k| k.as_str()) == Some("call")
+                        && s.get("confidence")
+                            .and_then(|c| c.as_f64())
+                            .unwrap_or(0.0)
+                            >= 0.90
+                })
+            })
+            .unwrap_or(false)
+    });
+    assert!(has_hi_conf_call, "expected >=0.90 call edge confidence");
 }
 
 #[test]
