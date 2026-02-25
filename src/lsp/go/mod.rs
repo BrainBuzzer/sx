@@ -8,6 +8,7 @@ use anyhow::{Context as _, Result, anyhow};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 
 use crate::config;
 use crate::lsp::{Location, Position, Range, normalize_path};
@@ -479,13 +480,12 @@ fn exit_status_string(st: &ExitStatus) -> String {
 }
 
 fn uri_to_path(uri: &str) -> Result<PathBuf> {
-    if let Some(stripped) = uri.strip_prefix("file://") {
-        // file:///a/b/c.go
-        let s = stripped.trim_start_matches('/');
-        let path = format!("/{}", s);
-        return Ok(PathBuf::from(path));
+    let url = Url::parse(uri).with_context(|| format!("parse URI {uri}"))?;
+    if url.scheme() != "file" {
+        return Err(anyhow!("unsupported URI {}", uri));
     }
-    Err(anyhow!("unsupported URI {}", uri))
+    url.to_file_path()
+        .map_err(|()| anyhow!("unsupported file URI {}", uri))
 }
 
 fn parse_location_lines(root_dir: &Path, stdout: &[u8]) -> Result<Vec<Location>> {
@@ -884,6 +884,13 @@ mod tests {
         assert_eq!(r.start.column, 6);
         assert_eq!(r.end.line, 3);
         assert_eq!(r.end.column, 9);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uri_to_path_decodes_percent_escapes() {
+        let p = uri_to_path("file:///repo/My%20Dir/main.go").unwrap();
+        assert_eq!(p, PathBuf::from("/repo/My Dir/main.go"));
     }
 
     #[test]

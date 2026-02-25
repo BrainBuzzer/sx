@@ -57,19 +57,27 @@ impl HybridEdgeProvider {
         let Some(file_hash) = file_content_hash(conn, sym.path.as_str())? else {
             return Ok(Vec::new());
         };
+        let generation = super::index_generation(conn)?;
 
         let cache_path = self
             .cache_dir
             .join(format!("{}-{}.json", sym.symbol_id, file_hash));
 
         let callees = match load_call_hierarchy_cache(&cache_path) {
-            Ok(Some(c)) if c.symbol_id == sym.symbol_id && c.content_hash == file_hash => c.callees,
+            Ok(Some(c))
+                if c.symbol_id == sym.symbol_id
+                    && c.content_hash == file_hash
+                    && c.index_generation == generation =>
+            {
+                c.callees
+            }
             _ => {
                 let generated = self.compute_call_hierarchy_callees(sym)?;
                 let cache = CallHierarchyCache {
                     symbol_id: sym.symbol_id.clone(),
                     path: sym.path.clone(),
                     content_hash: file_hash.clone(),
+                    index_generation: generation,
                     generated_at: crate::db::now_unix(),
                     callees: generated.clone(),
                 };
@@ -358,6 +366,8 @@ struct CallHierarchyCache {
     symbol_id: String,
     path: String,
     content_hash: String,
+    #[serde(default)]
+    index_generation: i64,
     generated_at: i64,
     callees: Vec<CallHierarchyCallee>,
 }
@@ -391,4 +401,24 @@ fn store_call_hierarchy_cache(path: &Path, cache: &CallHierarchyCache) -> Result
     fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_hierarchy_cache_backcompat_missing_index_generation() {
+        let json = r#"
+{
+  "symbol_id": "sym",
+  "path": "src/main.go",
+  "content_hash": "hash",
+  "generated_at": 123,
+  "callees": []
+}
+"#;
+        let parsed: CallHierarchyCache = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(parsed.index_generation, 0);
+    }
 }
