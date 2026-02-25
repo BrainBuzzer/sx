@@ -3,7 +3,7 @@ set -eu
 
 if command -v brew >/dev/null 2>&1; then
   echo "Installing sx via Homebrew..."
-  brew tap BrainBuzzer/semantic-explorer
+  brew tap BrainBuzzer/sx
   brew install sx
   exit 0
 fi

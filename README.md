@@ -22,7 +22,7 @@ the terminal or interactive TUI.
 ### Homebrew tap (recommended)
 
 ```sh
-brew tap BrainBuzzer/semantic-explorer
+brew tap BrainBuzzer/sx
 brew install sx
 ```
 
