@@ -111,7 +111,6 @@ sx embed --provider openai --model <model>
 ```sh
 sx vsearch "<query>"
 sx query "<query>"
-sx query "<query>" --deep
 ```
 
 6. Navigate findings:
