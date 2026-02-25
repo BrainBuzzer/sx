@@ -29,7 +29,7 @@ brew install sx
 ### One-line installer
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/BrainBuzzer/semantic-explorer/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/BrainBuzzer/sx/main/install.sh | sh
 ```
 
 ### Build from source
@@ -63,4 +63,3 @@ sx
 ## License
 
 MIT License. See [LICENSE](LICENSE).
-

@@ -15,5 +15,5 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 echo "Homebrew is not available. Falling back to cargo install."
-cargo install --git https://github.com/BrainBuzzer/semantic-explorer.git --locked --force
+cargo install --git https://github.com/BrainBuzzer/sx.git --locked --force
 echo "Installed sx using cargo."
