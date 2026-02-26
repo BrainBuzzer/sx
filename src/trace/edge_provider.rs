@@ -24,6 +24,7 @@ pub struct HybridEdgeProvider {
     root_dir: PathBuf,
     cache_dir: PathBuf,
     gopls: lsp::go::GoplsRunner,
+    allow_fresh_gopls: bool,
     file_lines: HashMap<String, Vec<String>>,
 }
 
@@ -37,6 +38,7 @@ impl HybridEdgeProvider {
             root_dir: root_dir.to_path_buf(),
             cache_dir,
             gopls: lsp::go::GoplsRunner::from_config(root_dir, cfg),
+            allow_fresh_gopls: true,
             file_lines: HashMap::new(),
         }
     }
@@ -47,6 +49,10 @@ impl HybridEdgeProvider {
 
     pub fn set_gopls_timeout_ms(&mut self, timeout_ms: u64) {
         self.gopls.set_timeout_ms(timeout_ms);
+    }
+
+    pub fn set_allow_fresh_gopls(&mut self, allow: bool) {
+        self.allow_fresh_gopls = allow;
     }
 
     fn call_edges_for_symbol(
@@ -72,6 +78,9 @@ impl HybridEdgeProvider {
                 c.callees
             }
             _ => {
+                if !self.allow_fresh_gopls {
+                    return Err(anyhow::anyhow!("gopls cache miss (fresh disabled)"));
+                }
                 let generated = self.compute_call_hierarchy_callees(sym)?;
                 let cache = CallHierarchyCache {
                     symbol_id: sym.symbol_id.clone(),

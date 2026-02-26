@@ -205,6 +205,7 @@ fn run_stage(
     let mut db_edges = edge_provider::DbEdgeProvider;
     let mut lsp_edges = edge_provider::HybridEdgeProvider::new(root_dir, cfg);
     let forced_lsp = matches!(go_lsp_mode, GoLspMode::Forced);
+    let allow_fresh_gopls = forced_lsp || use_llm_summary;
     let gopls_timeout_ms = if forced_lsp || use_llm_summary {
         cfg.lsp.go.timeout_ms
     } else {
@@ -212,6 +213,7 @@ fn run_stage(
         cfg.lsp.go.timeout_ms.min((timeout_ms / 2).max(250))
     };
     lsp_edges.set_gopls_timeout_ms(gopls_timeout_ms);
+    lsp_edges.set_allow_fresh_gopls(allow_fresh_gopls);
     let use_lsp_edges =
         matches!(go_lsp_mode, GoLspMode::Enabled | GoLspMode::Forced) && lsp_edges.gopls_available();
     let provider: &mut dyn rank::EdgeProvider = if use_lsp_edges {
