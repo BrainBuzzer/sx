@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod doctor;
 mod index;
+mod lsp;
 mod root;
 mod search;
 mod semantic;
@@ -154,6 +155,10 @@ fn main() -> anyhow::Result<()> {
                     let conn = db::open(&db_path)?;
                     db::migrate(&conn)?;
                     actions::trace(&conn, &root, &db_path, &config, args)?;
+                }
+                cli::Command::Lsp(args) => {
+                    let config = config::ensure_config(&config_path)?;
+                    actions::lsp(&root, &config, args)?;
                 }
                 cli::Command::Doctor => {
                     let config = config::load_or_default(&config_path)?;

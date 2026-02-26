@@ -17,6 +17,45 @@ the terminal or interactive TUI.
 - Rust 1.75+ for source builds.
 - `SQLite` and internet access when using remote embedding providers.
 
+## Go LSP support (gopls)
+
+`sx` can use `gopls` for more accurate Go semantics:
+
+- `sx trace` uses `gopls call_hierarchy` for Go call edges when available (auto-enabled).
+- `sx lsp ...` provides read-only Go navigation commands (definition, references, implementations, call hierarchy, symbols, diagnostics).
+
+Install `gopls`:
+
+```sh
+go install golang.org/x/tools/gopls@latest
+```
+
+Trace controls:
+
+```sh
+sx trace "<query>"          # auto-uses gopls for Go if available
+sx trace "<query>" --no-lsp # force heuristic mode
+sx trace "<query>" --lsp    # force gopls mode (errors if gopls missing)
+```
+
+Go navigation examples:
+
+```sh
+sx lsp def src/main.go:10:6
+sx lsp refs src/main.go:10:6 --declaration --json
+sx lsp impl src/main.go:10:6
+sx lsp calls src/main.go:10:6
+sx lsp symbols src/main.go
+sx lsp ws-symbol "Foo"
+sx lsp sig src/main.go:10:6
+sx lsp highlight src/main.go:10:6
+sx lsp check src/main.go
+```
+
+Configuration:
+
+- `.sx/config.toml`: `[lsp] enabled`, `[lsp.go] enabled`, and `[trace] go_use_gopls_calls`.
+
 ## Installation
 
 ### Homebrew tap (recommended)

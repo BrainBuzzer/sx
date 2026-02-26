@@ -1,3 +1,4 @@
+pub mod edge_provider;
 pub mod extract;
 pub mod graph;
 pub mod rank;
@@ -8,7 +9,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::cli::{OutputArgs, QueryArgs, TraceArgs};
 use crate::index::scan::is_test_case_path;
@@ -18,12 +19,15 @@ use self::types::{Citation, SymbolRecord, TraceResponse, TraceStageResult};
 
 pub fn run(
     conn: &Connection,
+    root_dir: &Path,
     db_path: &Path,
     cfg: &config::Config,
     args: TraceArgs,
 ) -> Result<TraceResponse> {
+    let go_lsp_mode = resolve_go_lsp_mode(root_dir, cfg, args.lsp, args.no_lsp)?;
     let (fast, fast_status) = run_stage(
         conn,
+        root_dir,
         db_path,
         cfg,
         &args.query,
@@ -34,11 +38,13 @@ pub fn run(
         cfg.trace.beam_fast,
         cfg.trace.fast_timeout_ms,
         false,
+        go_lsp_mode,
     )?;
 
     let (deep, deep_status) = if args.deep {
         let (deep_stage, status) = run_stage(
             conn,
+            root_dir,
             db_path,
             cfg,
             &args.query,
@@ -49,6 +55,7 @@ pub fn run(
             cfg.trace.beam_deep,
             cfg.trace.deep_timeout_ms,
             true,
+            go_lsp_mode,
         )?;
         (Some(deep_stage), status)
     } else {
@@ -75,6 +82,7 @@ pub fn run(
 
 pub fn run_fast_stage(
     conn: &Connection,
+    root_dir: &Path,
     db_path: &Path,
     cfg: &config::Config,
     query: &str,
@@ -83,8 +91,10 @@ pub fn run_fast_stage(
     langs: &[String],
     path_prefixes: &[String],
 ) -> Result<(TraceStageResult, String)> {
+    let go_lsp_mode = resolve_go_lsp_mode(root_dir, cfg, false, false)?;
     run_stage(
         conn,
+        root_dir,
         db_path,
         cfg,
         query,
@@ -95,11 +105,13 @@ pub fn run_fast_stage(
         cfg.trace.beam_fast,
         cfg.trace.fast_timeout_ms,
         false,
+        go_lsp_mode,
     )
 }
 
 pub fn run_deep_stage(
     conn: &Connection,
+    root_dir: &Path,
     db_path: &Path,
     cfg: &config::Config,
     query: &str,
@@ -108,8 +120,10 @@ pub fn run_deep_stage(
     langs: &[String],
     path_prefixes: &[String],
 ) -> Result<(TraceStageResult, String)> {
+    let go_lsp_mode = resolve_go_lsp_mode(root_dir, cfg, false, false)?;
     run_stage(
         conn,
+        root_dir,
         db_path,
         cfg,
         query,
@@ -120,11 +134,13 @@ pub fn run_deep_stage(
         cfg.trace.beam_deep,
         cfg.trace.deep_timeout_ms,
         true,
+        go_lsp_mode,
     )
 }
 
 fn run_stage(
     conn: &Connection,
+    root_dir: &Path,
     db_path: &Path,
     cfg: &config::Config,
     query: &str,
@@ -135,9 +151,23 @@ fn run_stage(
     beam: usize,
     timeout_ms: u64,
     use_llm_summary: bool,
+    go_lsp_mode: GoLspMode,
 ) -> Result<(TraceStageResult, String)> {
     let stage_name = if use_llm_summary { "deep" } else { "fast" };
-    if let Some(cached) = graph::get_cached_stage(conn, query, stage_name)? {
+    let stage_key = stage_cache_key(
+        conn,
+        stage_name,
+        go_lsp_mode,
+        limit_traces,
+        max_hops,
+        beam,
+        timeout_ms,
+        langs,
+        path_prefixes,
+        cfg,
+    )?;
+
+    if let Some(cached) = graph::get_cached_stage(conn, query, stage_key.as_str())? {
         if !stage_contains_test_paths(&cached)
             && should_use_cached_stage(cfg, use_llm_summary, &cached)
         {
@@ -171,7 +201,26 @@ fn run_stage(
         timeout_ms,
         edge_weights: cfg.trace.edge_weights.clone(),
     };
-    let (traces, status) = rank::find_paths(conn, query, &roots, &search_opts)?;
+
+    let mut db_edges = edge_provider::DbEdgeProvider;
+    let mut lsp_edges = edge_provider::HybridEdgeProvider::new(root_dir, cfg);
+    let forced_lsp = matches!(go_lsp_mode, GoLspMode::Forced);
+    let gopls_timeout_ms = if forced_lsp || use_llm_summary {
+        cfg.lsp.go.timeout_ms
+    } else {
+        // Keep fast-stage tracing responsive under load by bounding per-call gopls time (auto mode).
+        cfg.lsp.go.timeout_ms.min((timeout_ms / 2).max(250))
+    };
+    lsp_edges.set_gopls_timeout_ms(gopls_timeout_ms);
+    let use_lsp_edges =
+        matches!(go_lsp_mode, GoLspMode::Enabled | GoLspMode::Forced) && lsp_edges.gopls_available();
+    let provider: &mut dyn rank::EdgeProvider = if use_lsp_edges {
+        &mut lsp_edges
+    } else {
+        &mut db_edges
+    };
+
+    let (traces, status) = rank::find_paths(conn, query, &roots, &search_opts, provider)?;
     let citations = collect_citations(&traces);
     let deterministic = summarize::deterministic_summary(query, &traces, &citations);
     let decision = if use_llm_summary {
@@ -188,13 +237,137 @@ fn run_stage(
         summary_model: decision.model,
         summary_error: decision.error,
     };
-    let _ = graph::put_cached_stage(conn, query, stage_name, &stage);
+    let _ = graph::put_cached_stage(conn, query, stage_key.as_str(), &stage);
 
     let st = match status {
         rank::SearchStatus::Ready => "ready",
         rank::SearchStatus::Timeout => "timeout",
     };
     Ok((stage, st.to_string()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoLspMode {
+    Disabled,
+    Enabled,
+    Forced,
+}
+
+fn resolve_go_lsp_mode(
+    root_dir: &Path,
+    cfg: &config::Config,
+    force_lsp: bool,
+    force_no_lsp: bool,
+) -> Result<GoLspMode> {
+    if force_no_lsp {
+        return Ok(GoLspMode::Disabled);
+    }
+
+    if !cfg.lsp.enabled || !cfg.lsp.go.enabled {
+        if force_lsp {
+            return Err(anyhow::anyhow!(
+                "Go LSP is disabled. Enable it in .sx/config.toml under [lsp] and [lsp.go]."
+            ));
+        }
+        return Ok(GoLspMode::Disabled);
+    }
+
+    let want = if force_lsp {
+        true
+    } else {
+        cfg.trace.go_use_gopls_calls
+    };
+
+    if !want {
+        return Ok(GoLspMode::Disabled);
+    }
+
+    let probe = crate::lsp::go::GoplsRunner::from_config(root_dir, cfg);
+    if probe.is_available() {
+        if force_lsp {
+            Ok(GoLspMode::Forced)
+        } else {
+            Ok(GoLspMode::Enabled)
+        }
+    } else if force_lsp {
+        Err(anyhow::anyhow!(
+            "gopls is not available (expected `{}`). Install it with: `go install golang.org/x/tools/gopls@latest`",
+            cfg.lsp.go.gopls_path
+        ))
+    } else {
+        eprintln!(
+            "warning: gopls not found; falling back to heuristic Go trace edges (install with: `go install golang.org/x/tools/gopls@latest`)"
+        );
+        Ok(GoLspMode::Disabled)
+    }
+}
+
+fn stage_cache_key(
+    conn: &Connection,
+    stage: &str,
+    go_lsp_mode: GoLspMode,
+    limit_traces: usize,
+    max_hops: usize,
+    beam: usize,
+    timeout_ms: u64,
+    langs: &[String],
+    path_prefixes: &[String],
+    cfg: &config::Config,
+) -> Result<String> {
+    #[derive(serde::Serialize)]
+    struct Key<'a> {
+        stage: &'a str,
+        index_generation: i64,
+        go_lsp_mode: u8,
+        limit_traces: usize,
+        max_hops: usize,
+        beam: usize,
+        timeout_ms: u64,
+        langs: &'a [String],
+        path_prefixes: &'a [String],
+        candidate_roots: usize,
+        edge_weights: &'a config::TraceEdgeWeights,
+    }
+
+    let generation = index_generation(conn)?;
+    let key = Key {
+        stage,
+        index_generation: generation,
+        go_lsp_mode: match go_lsp_mode {
+            GoLspMode::Disabled => 0,
+            GoLspMode::Enabled => 1,
+            GoLspMode::Forced => 2,
+        },
+        limit_traces,
+        max_hops,
+        beam,
+        timeout_ms,
+        langs,
+        path_prefixes,
+        candidate_roots: cfg.trace.candidate_roots,
+        edge_weights: &cfg.trace.edge_weights,
+    };
+    let body = serde_json::to_vec(&key).context("serialize trace stage cache key")?;
+    let hash = blake3::hash(&body).to_hex().to_string();
+    Ok(format!(
+        "{stage}:g{generation}:go_lsp{}:{}",
+        key.go_lsp_mode,
+        &hash[..12]
+    ))
+}
+
+fn index_generation(conn: &Connection) -> Result<i64> {
+    let generation: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='index_generation'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("read meta.index_generation")?;
+    Ok(generation
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0))
 }
 
 fn should_use_cached_stage(

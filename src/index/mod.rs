@@ -234,6 +234,39 @@ VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
         }
     }
 
+    // Invalidate trace query cache and bump generation so stale results aren't reused.
+    let now = db::now_unix();
+    let current_gen: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='index_generation'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("read meta.index_generation")?;
+    let generation: i64 = current_gen
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    conn.execute(
+        r#"
+INSERT INTO meta(key, value) VALUES('index_generation', ?1)
+ON CONFLICT(key) DO UPDATE SET value=excluded.value
+"#,
+        (generation.to_string(),),
+    )
+    .context("write meta.index_generation")?;
+    conn.execute(
+        r#"
+INSERT INTO meta(key, value) VALUES('last_indexed_at', ?1)
+ON CONFLICT(key) DO UPDATE SET value=excluded.value
+"#,
+        (now.to_string(),),
+    )
+    .context("write meta.last_indexed_at")?;
+    conn.execute("DELETE FROM trace_query_cache", [])
+        .context("clear trace_query_cache")?;
+
     stats.duration_ms = started.elapsed().as_millis();
     Ok(stats)
 }

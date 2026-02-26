@@ -51,6 +51,8 @@ pub enum Command {
     Query(QueryArgs),
     /// Graph-first semantic trace search (paths + summary)
     Trace(TraceArgs),
+    /// Language-server powered navigation (Go via gopls)
+    Lsp(LspArgs),
     /// Manage global provider credentials
     Auth(AuthArgs),
     /// Launch the interactive terminal UI (default when no subcommand is provided)
@@ -337,6 +339,14 @@ pub struct TraceArgs {
     #[arg(long, default_value_t = true)]
     pub deep: bool,
 
+    /// Force Go LSP call edges via gopls (errors if gopls is missing)
+    #[arg(long, conflicts_with = "no_lsp")]
+    pub lsp: bool,
+
+    /// Disable Go LSP integration (use heuristic edges only)
+    #[arg(long, conflicts_with = "lsp")]
+    pub no_lsp: bool,
+
     /// Filter by language (repeatable)
     #[arg(long, value_name = "LANG")]
     pub lang: Vec<String>,
@@ -344,6 +354,73 @@ pub struct TraceArgs {
     /// Filter by path prefix (repeatable, repo-relative)
     #[arg(long = "path-prefix", value_name = "PREFIX")]
     pub path_prefix: Vec<String>,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LspArgs {
+    #[command(subcommand)]
+    pub command: LspCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum LspCommand {
+    /// Go-to-definition at position
+    Def(LspPosArgs),
+    /// Find references at position
+    Refs(LspRefsArgs),
+    /// Find implementations at position
+    Impl(LspPosArgs),
+    /// Call hierarchy at position (incoming + outgoing)
+    Calls(LspPosArgs),
+    /// Document symbols for file
+    Symbols(LspPathArgs),
+    /// Workspace symbol search
+    WsSymbol(LspWsSymbolArgs),
+    /// Signature help at position
+    Sig(LspPosArgs),
+    /// Identifier highlight ranges at position
+    Highlight(LspPosArgs),
+    /// Diagnostics for file
+    Check(LspPathArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LspPosArgs {
+    /// 1-indexed position in `path:line:column` form
+    pub position: String,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LspRefsArgs {
+    /// 1-indexed position in `path:line:column` form
+    pub position: String,
+
+    /// Include the declaration in references results
+    #[arg(short = 'd', long = "declaration")]
+    pub declaration: bool,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LspPathArgs {
+    /// Repo-relative path (or absolute)
+    pub path: String,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LspWsSymbolArgs {
+    pub query: String,
 
     #[command(flatten)]
     pub output: OutputArgs,
